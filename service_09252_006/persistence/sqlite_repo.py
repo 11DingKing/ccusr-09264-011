@@ -18,6 +18,7 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CrossInstitutionGrant,
     Material,
     MaterialVersion,
     Objection,
@@ -27,7 +28,157 @@ from ..domain.models import (
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_SCHEMA_V1 = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id        TEXT PRIMARY KEY,
+        institution_id TEXT,
+        roles_json     TEXT NOT NULL,
+        display_name   TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS blobs (
+        sha256     TEXT PRIMARY KEY,
+        data       BLOB NOT NULL,
+        media_type TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS materials (
+        material_id        TEXT PRIMARY KEY,
+        institution_id     TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        sensitivity        TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        current_version_id TEXT,
+        withdrawn          INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS versions (
+        version_id              TEXT PRIMARY KEY,
+        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+        institution_id          TEXT NOT NULL,
+        sha256                  TEXT NOT NULL,
+        size                    INTEGER NOT NULL,
+        media_type              TEXT NOT NULL,
+        version_no              INTEGER NOT NULL,
+        supersedes_version_id   TEXT,
+        created_by              TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        withdrawn               INTEGER NOT NULL DEFAULT 0,
+        withdrawn_at            TEXT,
+        UNIQUE(material_id, version_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS packages (
+        package_id            TEXT PRIMARY KEY,
+        institution_id        TEXT NOT NULL,
+        title                 TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        created_by            TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        sealed_at             TEXT,
+        manifest_fingerprint  TEXT,
+        decided_at            TEXT,
+        decision              TEXT,
+        decision_note         TEXT,
+        review_fingerprint    TEXT,
+        supersedes_package_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS entries (
+        entry_id    TEXT PRIMARY KEY,
+        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+        material_id TEXT NOT NULL,
+        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+        sha256      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        sensitivity TEXT NOT NULL,
+        added_at    TEXT NOT NULL,
+        UNIQUE(package_id, version_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS requests (
+        request_id       TEXT PRIMARY KEY,
+        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id   TEXT NOT NULL,
+        reviewer_id      TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        assigned_by      TEXT NOT NULL,
+        assigned_at      TEXT NOT NULL,
+        responded_at     TEXT,
+        completed_at     TEXT,
+        verdict          TEXT,
+        comment          TEXT,
+        deadline_at_utc  TEXT,
+        deadline_timezone TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+        ON requests(reviewer_id, status);
+    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+
+    CREATE TABLE IF NOT EXISTS objections (
+        objection_id  TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id TEXT NOT NULL,
+        reviewer_id   TEXT NOT NULL,
+        category      TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        audit_id       TEXT PRIMARY KEY,
+        package_id     TEXT,
+        institution_id TEXT,
+        actor_id       TEXT NOT NULL,
+        action         TEXT NOT NULL,
+        at             TEXT NOT NULL,
+        detail_json    TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        result_json     TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token       TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(user_id),
+        created_at  TEXT NOT NULL
+    );
+
+    PRAGMA user_version = 1;
+"""
+
+_SCHEMA_V2 = """
+    -- 跨机构授权：授予方/接收方/字段范围分别成列；撤销只追加
+    -- revoked_at/revoked_by，记录保留供历史审计查询。
+    CREATE TABLE IF NOT EXISTS cross_institution_grants (
+        grant_id                  TEXT PRIMARY KEY,
+        granter_institution_id    TEXT NOT NULL,
+        receiver_institution_id   TEXT NOT NULL,
+        field_scopes_json         TEXT NOT NULL,
+        status                    TEXT NOT NULL,
+        proposed_by               TEXT NOT NULL,
+        proposed_at               TEXT NOT NULL,
+        confirmed_by              TEXT,
+        confirmed_at              TEXT,
+        revoked_by                TEXT,
+        revoked_at                TEXT,
+        revoke_reason             TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_grants_pair
+        ON cross_institution_grants(
+            granter_institution_id, receiver_institution_id, status);
+
+    PRAGMA user_version = 2;
+"""
 
 
 class SqliteRepository(Repository):
@@ -49,136 +200,12 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
-
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
-
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
-
-                PRAGMA user_version = 1;
-            """
-        )
+        if version < 1:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            # v2：跨机构授权表（授予方/接收方/字段范围/撤销时间）
+            self._conn.executescript(_SCHEMA_V2)
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -667,6 +694,89 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ------------------------------------------------------------------ grants
+    def insert_grant(self, grant: CrossInstitutionGrant) -> None:
+        self._conn.execute(
+            "INSERT INTO cross_institution_grants(grant_id, granter_institution_id,"
+            " receiver_institution_id, field_scopes_json, status, proposed_by,"
+            " proposed_at, confirmed_by, confirmed_at, revoked_by, revoked_at,"
+            " revoke_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                grant.grant_id,
+                grant.granter_institution_id,
+                grant.receiver_institution_id,
+                json.dumps(list(grant.field_scopes), ensure_ascii=False),
+                grant.status,
+                grant.proposed_by,
+                grant.proposed_at,
+                grant.confirmed_by,
+                grant.confirmed_at,
+                grant.revoked_by,
+                grant.revoked_at,
+                grant.revoke_reason,
+            ),
+        )
+
+    def get_grant(self, grant_id: str) -> CrossInstitutionGrant | None:
+        row = self._conn.execute(
+            "SELECT * FROM cross_institution_grants WHERE grant_id = ?",
+            (grant_id,),
+        ).fetchone()
+        return None if row is None else _row_to_grant(row)
+
+    def update_grant(self, grant: CrossInstitutionGrant) -> None:
+        self._conn.execute(
+            "UPDATE cross_institution_grants SET status = ?, confirmed_by = ?,"
+            " confirmed_at = ?, revoked_by = ?, revoked_at = ?, revoke_reason = ?"
+            " WHERE grant_id = ?",
+            (
+                grant.status,
+                grant.confirmed_by,
+                grant.confirmed_at,
+                grant.revoked_by,
+                grant.revoked_at,
+                grant.revoke_reason,
+                grant.grant_id,
+            ),
+        )
+
+    def list_grants(
+        self,
+        *,
+        granter_institution_id: str | None = None,
+        receiver_institution_id: str | None = None,
+        status: str | None = None,
+    ) -> list[CrossInstitutionGrant]:
+        sql = "SELECT * FROM cross_institution_grants"
+        clauses: list[str] = []
+        params: list = []
+        if granter_institution_id is not None:
+            clauses.append("granter_institution_id = ?")
+            params.append(granter_institution_id)
+        if receiver_institution_id is not None:
+            clauses.append("receiver_institution_id = ?")
+            params.append(receiver_institution_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY proposed_at"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_grant(r) for r in rows]
+
+    def list_active_grants(
+        self, granter_institution_id: str, receiver_institution_id: str
+    ) -> list[CrossInstitutionGrant]:
+        rows = self._conn.execute(
+            "SELECT * FROM cross_institution_grants"
+            " WHERE granter_institution_id = ? AND receiver_institution_id = ?"
+            " AND status = 'active' AND revoked_at IS NULL"
+            " ORDER BY proposed_at",
+            (granter_institution_id, receiver_institution_id),
+        ).fetchall()
+        return [_row_to_grant(r) for r in rows]
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +826,21 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_grant(row: sqlite3.Row) -> CrossInstitutionGrant:
+    return CrossInstitutionGrant(
+        grant_id=row["grant_id"],
+        granter_institution_id=row["granter_institution_id"],
+        receiver_institution_id=row["receiver_institution_id"],
+        field_scopes=tuple(json.loads(row["field_scopes_json"])),
+        status=row["status"],
+        proposed_by=row["proposed_by"],
+        proposed_at=row["proposed_at"],
+        confirmed_by=row["confirmed_by"],
+        confirmed_at=row["confirmed_at"],
+        revoked_by=row["revoked_by"],
+        revoked_at=row["revoked_at"],
+        revoke_reason=row["revoke_reason"],
     )

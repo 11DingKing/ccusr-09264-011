@@ -37,6 +37,16 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 跨机构授权（双方确认）
+- 授予方机构管理员发起授权（`proposed`），**接收方机构管理员确认**后生效
+  （`active`）；任一方可撤销（`revoked`）。授予方、接收方、字段范围分别
+  成列记录在 SQLite（`cross_institution_grants`）。
+- 字段范围支持 `kind:<材料类型>`（如 `kind:enterprise_feedback`）与
+  `material:<material_id>` 两种粒度；范围外条目仍按最小披露遮蔽。
+- 访问中间件**每次请求实时查询**有效授权（不缓存）：撤销提交后新请求
+  立即 403；撤销只追加 `revoked_at`，授权记录与 `grant.*` 审计事件
+  （发起/确认/访问/撤销）全部保留，审计仍可查询。
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -106,6 +116,12 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/grants` | 发起跨机构授权（授予方管理员，字段范围） |
+| POST | `/v1/grants/{id}/confirm` | 接收方管理员确认，授权生效 |
+| POST | `/v1/grants/{id}/revoke` | 任一方撤销（留痕，新请求立即拒绝） |
+| GET  | `/v1/grants` | 本机构相关授权列表（审计/权威机构看全部） |
+| GET  | `/v1/grants/{id}` | 授权详情（含 revoked_at） |
+| GET  | `/v1/audit` | 审计日志（仅审计/权威机构；撤销后历史可查） |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -119,6 +135,8 @@ python3 -m compileall -q service_09252_006 tests
 
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
+**跨机构授权**（双方确认生命周期、字段范围粒度、撤销即时生效与
+旧审计保留、v1→v2 schema 迁移、HTTP 端到端）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。

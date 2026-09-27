@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CrossInstitutionGrant,
     Material,
     MaterialVersion,
     Objection,
@@ -148,3 +149,32 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 跨机构授权 ----
+    @abc.abstractmethod
+    def insert_grant(self, grant: CrossInstitutionGrant) -> None: ...
+
+    @abc.abstractmethod
+    def get_grant(self, grant_id: str) -> CrossInstitutionGrant | None: ...
+
+    @abc.abstractmethod
+    def update_grant(self, grant: CrossInstitutionGrant) -> None: ...
+
+    @abc.abstractmethod
+    def list_grants(
+        self,
+        *,
+        granter_institution_id: str | None = None,
+        receiver_institution_id: str | None = None,
+        status: str | None = None,
+    ) -> list[CrossInstitutionGrant]: ...
+
+    @abc.abstractmethod
+    def list_active_grants(
+        self, granter_institution_id: str, receiver_institution_id: str
+    ) -> list[CrossInstitutionGrant]:
+        """某授予方->接收方方向上当前有效的授权（撤销判定的事实来源）。
+
+        访问中间件每次请求都重新查询本方法，不做缓存——撤销提交后
+        下一个请求立即被拒绝。
+        """

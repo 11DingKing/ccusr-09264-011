@@ -146,5 +146,31 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class CrossInstitutionGrant:
+    """跨机构授权：授予方向接收方让渡部分字段范围的访问权。
+
+    生命周期：proposed（授予方发起）→ active（接收方确认，双方确认完成）
+    → revoked（任一方撤销）。撤销只追加 revoked_at，记录永不删除——
+    撤销后新请求立即拒绝，但授权与撤销事件在历史审计中永远可查。
+
+    field_scopes 为字段范围清单（例如 ["enterprise_feedback"] 或具体的
+    material_id / 字段名），仅范围内资源可被接收方跨机构访问。
+    """
+
+    grant_id: str
+    granter_institution_id: str    # 授予方机构
+    receiver_institution_id: str   # 接收方机构
+    field_scopes: tuple[str, ...]
+    status: str                    # GrantStatus
+    proposed_by: str
+    proposed_at: str
+    confirmed_by: Optional[str]
+    confirmed_at: Optional[str]
+    revoked_by: Optional[str]
+    revoked_at: Optional[str]
+    revoke_reason: Optional[str]
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)

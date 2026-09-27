@@ -394,6 +394,64 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------- 跨机构授权
+    def propose_grant(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.grants.propose_grant(
+            actor,
+            receiver_institution_id=body["receiver_institution_id"],
+            field_scopes=body.get("field_scopes"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def confirm_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            self.services.grants.confirm_grant(
+                actor,
+                grant_id=grant_id,
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def revoke_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        self._send_json(
+            200,
+            self.services.grants.revoke_grant(
+                actor,
+                grant_id=grant_id,
+                reason=body.get("reason", ""),
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def list_grants(self) -> None:
+        actor = self._actor()
+        self._send_json(200, {"grants": self.services.grants.list_grants(actor)})
+
+    def get_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.grants.get_grant(actor, grant_id))
+
+    def list_audit(self) -> None:
+        """审计查询：仅审计/权威机构；撤销后的历史授权事件仍可查。"""
+        from ..domain.enums import Role as _Role
+        from ..domain.errors import PermissionDeniedError
+        from ..domain.models import asdict as _asdict
+
+        actor = self._actor()
+        if not (
+            actor.has_role(_Role.AUDITOR) or actor.has_role(_Role.QUALITY_AUTHORITY)
+        ):
+            raise PermissionDeniedError("仅审计或质量权威机构可查询审计日志")
+        entries = self.services.repo.list_audit(limit=500)
+        self._send_json(200, {"audit": [_asdict(e) for e in entries]})
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +471,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/grants", "propose_grant"),
+        ("/v1/grants/{grant_id}/confirm", "confirm_grant"),
+        ("/v1/grants/{grant_id}/revoke", "revoke_grant"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +485,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/grants", "list_grants"),
+        ("/v1/grants/{grant_id}", "get_grant"),
+        ("/v1/audit", "list_audit"),
     ]
     return {"POST": post, "GET": get}
 

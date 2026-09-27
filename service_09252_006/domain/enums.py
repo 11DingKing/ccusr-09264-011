@@ -49,3 +49,11 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class GrantStatus(str, Enum):
+    """跨机构授权生命周期：授予方发起 -> 接收方确认 -> （可被任一方）撤销。"""
+
+    PROPOSED = "proposed"  # 授予方已发起，等待接收方确认
+    ACTIVE = "active"      # 双方确认完成，新请求按字段范围放行
+    REVOKED = "revoked"    # 已撤销：新请求立即拒绝，仅保留历史记录

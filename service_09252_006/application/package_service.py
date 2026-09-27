@@ -21,9 +21,15 @@ from ..domain.errors import (
 from ..domain.fingerprint import manifest_fingerprint
 from ..domain.models import PackageEntry, ReviewPackage, User
 from .base import Service, require_roles
+from .grant_service import AccessMiddleware
 
 
 class PackageService(Service):
+    def __init__(self, repo, clock, ids, *, access: AccessMiddleware | None = None):
+        super().__init__(repo, clock, ids)
+        # 跨机构访问中间件：实时核对 SQLite 有效授权，撤销后立即拒绝
+        self.access = access or AccessMiddleware(repo, clock, ids)
+
     def create_package(
         self,
         actor: User,
@@ -245,7 +251,8 @@ class PackageService(Service):
 
         曾被分配到该包的评审人（即使请求已取消/拒绝）可打开视图看到
         非敏感条目与“存在敏感条目”的事实，但敏感内容按当前有效分配遮蔽；
-        与该包毫无关系的外部机构用户直接拒绝。
+        与该包毫无关系的外部机构用户，须持有覆盖包内字段范围的有效
+        跨机构授权（双方确认且未撤销），否则直接拒绝。
         """
         package = self.repo.get_package(package_id)
         if package is None:
@@ -257,13 +264,17 @@ class PackageService(Service):
                 for r in self.repo.list_requests_by_package(package_id)
             )
         )
+        via_grant = False
         if (
             actor.institution_id != package.institution_id
             and not actor.has_role(Role.QUALITY_AUTHORITY)
             and not actor.has_role(Role.AUDITOR)
             and not is_assigned
         ):
-            raise PermissionDeniedError("不能查看其他机构评审包")
+            # 跨机构访问中间件：实时核对 SQLite 有效授权，
+            # 授权撤销后此请求立即被拒绝
+            self.access.enforce_package_access(actor, package)
+            via_grant = True
 
         active = {
             r.package_id
@@ -275,9 +286,16 @@ class PackageService(Service):
         hidden_count = 0
         for entry in package.entries:
             can_see = ctx.can_see_entry(entry, package)
+            if not can_see and via_grant:
+                can_see = self.access.entry_visible_via_grant(
+                    actor, package=package, entry=entry
+                )
             if not can_see:
                 hidden_count += 1
             visible_entries.append(redact_entry(entry, can_see))
+
+        if via_grant:
+            self.access.audit_grant_access(actor, package=package)
 
         view = self._package_dict(package)
         view["entries"] = visible_entries
@@ -291,7 +309,8 @@ class PackageService(Service):
         """通过评审包条目下载内容字节，强制走最小披露授权。
 
         返回 (版本描述, 字节, media_type)。评审人只可下载其仍有效分配
-        所在包的敏感反馈；请求一旦取消，授权即时消失。
+        所在包的敏感反馈；请求一旦取消，授权即时消失。跨机构用户须持有
+        覆盖该条目字段范围的有效授权，撤销后立即被拒绝。
         """
         package = self.repo.get_package(package_id)
         if package is None:
@@ -307,7 +326,9 @@ class PackageService(Service):
         }
         ctx = DisclosureContext(actor, active)
         if not ctx.can_see_entry(entry, package):
-            raise PermissionDeniedError("无权下载该材料（最小披露限制）")
+            # 既有披露规则不覆盖时，走跨机构授权中间件（实时查询，不缓存）
+            self.access.enforce_entry_access(actor, package=package, entry=entry)
+            self.access.audit_grant_access(actor, package=package, entry=entry)
         version = self.repo.get_version(version_id)
         blob = self.repo.get_blob(entry.sha256)
         if version is None or blob is None:
