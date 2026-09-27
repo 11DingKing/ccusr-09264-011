@@ -19,11 +19,16 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..domain.fingerprint import manifest_fingerprint
+from ..domain.grants import grant_covers
 from ..domain.models import PackageEntry, ReviewPackage, User
 from .base import Service, require_roles
 
 
 class PackageService(Service):
+    def __init__(self, repo, clock, ids, grants=None) -> None:
+        super().__init__(repo, clock, ids)
+        # 跨机构授权中间件（GrantService）；每个跨机构请求实时校验
+        self._grants = grants
     def create_package(
         self,
         actor: User,
@@ -245,7 +250,8 @@ class PackageService(Service):
 
         曾被分配到该包的评审人（即使请求已取消/拒绝）可打开视图看到
         非敏感条目与“存在敏感条目”的事实，但敏感内容按当前有效分配遮蔽；
-        与该包毫无关系的外部机构用户直接拒绝。
+        与该包毫无关系的外部机构用户直接拒绝——除非持有双方确认的
+        跨机构授权，此时按授权字段范围放行（敏感条目仍不开放）。
         """
         package = self.repo.get_package(package_id)
         if package is None:
@@ -257,13 +263,15 @@ class PackageService(Service):
                 for r in self.repo.list_requests_by_package(package_id)
             )
         )
+        grants: list = []
         if (
             actor.institution_id != package.institution_id
             and not actor.has_role(Role.QUALITY_AUTHORITY)
             and not actor.has_role(Role.AUDITOR)
             and not is_assigned
         ):
-            raise PermissionDeniedError("不能查看其他机构评审包")
+            # 跨机构中间件：实时查库，撤销后的新请求在此立即被拒绝
+            grants = self._require_cross_institution_access(actor, package)
 
         active = {
             r.package_id
@@ -273,8 +281,11 @@ class PackageService(Service):
 
         visible_entries = []
         hidden_count = 0
+        now = self.clock.now_utc()
         for entry in package.entries:
-            can_see = ctx.can_see_entry(entry, package)
+            can_see = ctx.can_see_entry(entry, package) or any(
+                grant_covers(g, actor, package, entry, now=now) for g in grants
+            )
             if not can_see:
                 hidden_count += 1
             visible_entries.append(redact_entry(entry, can_see))
@@ -283,6 +294,13 @@ class PackageService(Service):
         view["entries"] = visible_entries
         view["redacted_entries"] = hidden_count
         view["viewer"] = actor.user_id
+        if grants:
+            view["via_grant"] = {
+                "grant_id": grants[0].grant_id,
+                "field_scopes": sorted(
+                    {s for g in grants for s in g.field_scopes}
+                ),
+            }
         return view
 
     def download_entry(
@@ -291,7 +309,8 @@ class PackageService(Service):
         """通过评审包条目下载内容字节，强制走最小披露授权。
 
         返回 (版本描述, 字节, media_type)。评审人只可下载其仍有效分配
-        所在包的敏感反馈；请求一旦取消，授权即时消失。
+        所在包的敏感反馈；请求一旦取消，授权即时消失。跨机构用户须持有
+        生效授权且条目字段在授权范围内（敏感内容不随授权开放）。
         """
         package = self.repo.get_package(package_id)
         if package is None:
@@ -306,8 +325,24 @@ class PackageService(Service):
             for r in self.repo.list_active_requests_by_reviewer(actor.user_id)
         }
         ctx = DisclosureContext(actor, active)
+        now = self.clock.now_utc()
         if not ctx.can_see_entry(entry, package):
-            raise PermissionDeniedError("无权下载该材料（最小披露限制）")
+            # 跨机构中间件：无生效授权或授权已撤销 -> 立即拒绝
+            grants = self._require_cross_institution_access(actor, package)
+            covering = next(
+                (g for g in grants if grant_covers(g, actor, package, entry, now=now)),
+                None,
+            )
+            if covering is None:
+                raise PermissionDeniedError(
+                    "无权下载该材料（最小披露限制/授权字段范围外）",
+                    details={
+                        "field_scopes": sorted(
+                            {s for g in grants for s in g.field_scopes}
+                        ),
+                        "kind": entry.kind,
+                    },
+                )
         version = self.repo.get_version(version_id)
         blob = self.repo.get_blob(entry.sha256)
         if version is None or blob is None:
@@ -319,6 +354,24 @@ class PackageService(Service):
             "media_type": version.media_type,
             "size": version.size,
         }, blob.data, version.media_type
+
+    def _require_cross_institution_access(
+        self, actor: User, package: ReviewPackage
+    ) -> list:
+        """跨机构新请求的闸门：委托 GrantService 实时校验授权。
+
+        本机构成员/监管角色不经授权（返回空列表）；其余跨机构访问必须
+        持有双方确认且未撤销的授权，否则立即拒绝。
+        """
+        if (
+            actor.institution_id == package.institution_id
+            or actor.has_role(Role.QUALITY_AUTHORITY)
+            or actor.has_role(Role.AUDITOR)
+        ):
+            return []
+        if self._grants is None:
+            raise PermissionDeniedError("不能查看其他机构评审包")
+        return self._grants.require_access(actor, package)
 
     def list_packages(self, actor: User) -> list[dict]:
         if actor.has_role(Role.AUDITOR) or actor.has_role(Role.QUALITY_AUTHORITY):

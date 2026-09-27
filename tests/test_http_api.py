@@ -197,6 +197,92 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_cross_institution_grant_revocation_over_http(self) -> None:
+        """双方确认授权 -> 跨机构可访问；撤销后新请求立即 403；旧审计仍可查。"""
+        admin_a = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-a"
+        )
+        admin_b = self._create_user(
+            "admin-b", ["institution_admin"], "inst-b", "tok-b"
+        )
+        member_b = self._create_user(
+            "mem-b", ["institution_submitter"], "inst-b", "tok-memb"
+        )
+
+        # inst-a 组包封存（大纲 + 敏感企业反馈）
+        import base64 as _b64
+
+        status, mat = admin_a.request(
+            "POST", "/v1/materials",
+            {"kind": "syllabus", "title": "大纲", "sensitivity": "normal"},
+        )
+        self.assertEqual(status, 201)
+        syllabus = "大纲正文".encode("utf-8")
+        status, ver = admin_a.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": _b64.b64encode(syllabus).decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+        status, pkg = admin_a.request("POST", "/v1/packages", {"title": "包"})
+        pid = pkg["package_id"]
+        admin_a.request(
+            "POST", f"/v1/packages/{pid}/entries",
+            {"version_id": ver["version_id"]},
+        )
+        admin_a.request("POST", f"/v1/packages/{pid}/seal", {})
+
+        # 授权前：inst-b 用户新请求 403
+        status, body = member_b.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(status, 403)
+
+        # 授予方提议（字段范围 syllabus）
+        status, grant = admin_a.request(
+            "POST", "/v1/grants",
+            {"recipient_institution_id": "inst-b", "field_scopes": ["syllabus"]},
+        )
+        self.assertEqual(status, 201, grant)
+        gid = grant["grant_id"]
+        self.assertEqual(grant["status"], "proposed")
+
+        # 仅提议未确认：仍 403
+        status, _ = member_b.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(status, 403)
+
+        # 接收方确认（双方确认）后可访问
+        status, confirmed = admin_b.request(
+            "POST", f"/v1/grants/{gid}/confirm", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(confirmed["status"], "active")
+        status, view = member_b.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(view["via_grant"]["grant_id"], gid)
+        status, payload, _ = member_b.request(
+            "GET", f"/v1/packages/{pid}/entries/{ver['version_id']}/content",
+            raw=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, syllabus)
+
+        # 撤销：新请求立即拒绝
+        status, revoked = admin_a.request(
+            "POST", f"/v1/grants/{gid}/revoke", {"reason": "学期合作结束"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertIsNotNone(revoked["revoked_at"])
+        status, body = member_b.request("GET", f"/v1/packages/{pid}")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "permission_denied")
+
+        # 旧审计仍可查看：提议/确认/撤销都在
+        status, audit_body = admin_b.request("GET", f"/v1/grants/{gid}/audit")
+        self.assertEqual(status, 200)
+        actions = [a["action"] for a in audit_body["audit"]]
+        self.assertIn("grant.proposed", actions)
+        self.assertIn("grant.confirmed", actions)
+        self.assertIn("grant.revoked", actions)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,3 +49,9 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class GrantStatus(str, Enum):
+    PROPOSED = "proposed"  # 授予方已提议，等待接收方确认
+    ACTIVE = "active"      # 双方确认，跨机构新请求按此放行
+    REVOKED = "revoked"    # 已撤销：新请求立即拒绝，记录保留可审计

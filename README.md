@@ -37,6 +37,19 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 跨机构授权（合作机构变更授权）
+- 合作机构间的数据让渡需**双方确认**：授予方机构管理员提议，接收方机构
+  管理员确认后授权才生效（`proposed → active`）；质量权威机构不能代确认。
+- 每条授权分别记录**授予方机构、接收方机构（可限定到具体接收人）与字段
+  范围**（材料类别 syllabus/faculty/assessment/enterprise_feedback），
+  落 SQLite `grants` 表。
+- 字段授权只放开**非敏感字段**；敏感企业反馈仍受最小披露约束，不随授权开放。
+- 任一方可撤销：撤销是追加标记（`revoked_by/revoked_at/revoke_reason`），
+  记录永不删除。Python 中间件在包视图/下载路径上对每个**新请求实时查库**，
+  撤销一旦落库，下一个请求立即拒绝（403）。
+- 撤销不影响历史：授权详情与提议/确认/撤销/拒绝的**旧审计轨迹仍可查看**
+  （`GET /v1/grants/{id}/audit`）。
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -50,9 +63,9 @@
 
 ```
 service_09252_006/
-  domain/        实体、枚举、错误、指纹纯函数、披露策略
-  application/   用例服务（证据/评审包/评审）、端口（Clock、Id、Repository）
-  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址）
+  domain/        实体、枚举、错误、指纹纯函数、披露/跨机构授权策略
+  application/   用例服务（证据/评审包/评审/跨机构授权）、端口（Clock、Id、Repository）
+  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址、授权表）
   api/           HTTP 边界（Bearer 鉴权、路由、JSON 编解码）
   cli.py         serve / 离线 verify
 ```
@@ -106,6 +119,12 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/grants` | 授予方提议跨机构授权（接收方+字段范围） |
+| POST | `/v1/grants/{id}/confirm` | 接收方确认（双方确认后生效） |
+| POST | `/v1/grants/{id}/revoke` | 任一方撤销（记录撤销时间，新请求立即拒绝） |
+| GET  | `/v1/grants` | 列出本机构授予/接收的授权（审计可见全部） |
+| GET  | `/v1/grants/{id}` | 授权详情（含字段范围与撤销时间，撤销后可查） |
+| GET  | `/v1/grants/{id}/audit` | 授权审计轨迹（撤销后旧审计仍可查看） |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -119,6 +138,8 @@ python3 -m compileall -q service_09252_006 tests
 
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
+**跨机构授权**（双方确认、授予方/接收方/字段范围落库、撤销即时拒绝新请求、
+撤销后旧审计仍可查看、敏感字段不随授权开放）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。

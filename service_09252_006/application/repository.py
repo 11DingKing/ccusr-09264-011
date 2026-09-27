@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CrossInstitutionGrant,
     Material,
     MaterialVersion,
     Objection,
@@ -148,3 +149,37 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    @abc.abstractmethod
+    def list_audit_by_grant(self, grant_id: str) -> list[AuditEntry]:
+        """某条跨机构授权的完整审计轨迹（撤销后仍可查）。"""
+
+    # ---- 跨机构授权 ----
+    @abc.abstractmethod
+    def insert_grant(self, grant: CrossInstitutionGrant) -> None: ...
+
+    @abc.abstractmethod
+    def get_grant(self, grant_id: str) -> CrossInstitutionGrant | None: ...
+
+    @abc.abstractmethod
+    def update_grant(self, grant: CrossInstitutionGrant) -> None: ...
+
+    @abc.abstractmethod
+    def list_grants(
+        self,
+        grantor_institution_id: str | None = None,
+        recipient_institution_id: str | None = None,
+    ) -> list[CrossInstitutionGrant]: ...
+
+    @abc.abstractmethod
+    def find_active_grants(
+        self,
+        grantor_institution_id: str,
+        recipient_institution_id: str,
+        recipient_user_id: str,
+    ) -> list[CrossInstitutionGrant]:
+        """所有当前生效（active 且未撤销）且覆盖该接收人的授权。
+
+        机构级（recipient_user_id 为空）与用户级授权可并存，字段范围
+        取并集。中间件每个新请求都实时执行本查询。
+        """

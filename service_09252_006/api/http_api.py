@@ -394,6 +394,57 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------- 跨机构授权
+    def propose_grant(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.grants.propose_grant(
+            actor,
+            recipient_institution_id=body["recipient_institution_id"],
+            field_scopes=body.get("field_scopes") or [],
+            recipient_user_id=body.get("recipient_user_id"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def confirm_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200,
+            self.services.grants.confirm_grant(
+                actor,
+                grant_id=grant_id,
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def revoke_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        self._send_json(
+            200,
+            self.services.grants.revoke_grant(
+                actor,
+                grant_id=grant_id,
+                reason=body.get("reason", ""),
+                idempotency_key=self._idempotency_key(),
+            ),
+        )
+
+    def list_grants(self) -> None:
+        actor = self._actor()
+        self._send_json(200, {"grants": self.services.grants.list_grants(actor)})
+
+    def get_grant(self, grant_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.grants.get_grant(actor, grant_id))
+
+    def grant_audit(self, grant_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"audit": self.services.grants.grant_audit(actor, grant_id)}
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +464,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/grants", "propose_grant"),
+        ("/v1/grants/{grant_id}/confirm", "confirm_grant"),
+        ("/v1/grants/{grant_id}/revoke", "revoke_grant"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +478,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/grants", "list_grants"),
+        ("/v1/grants/{grant_id}", "get_grant"),
+        ("/v1/grants/{grant_id}/audit", "grant_audit"),
     ]
     return {"POST": post, "GET": get}
 

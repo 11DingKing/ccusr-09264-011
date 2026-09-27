@@ -18,6 +18,7 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CrossInstitutionGrant,
     Material,
     MaterialVersion,
     Objection,
@@ -27,7 +28,7 @@ from ..domain.models import (
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -49,8 +50,12 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
+        if version < 1:
+            self._migrate_v1()
+        if version < 2:
+            self._migrate_v2()
+
+    def _migrate_v1(self) -> None:
         # executescript 会自行提交事务；把 user_version 写入放在同一脚本
         self._conn.executescript(
             """
@@ -177,6 +182,33 @@ class SqliteRepository(Repository):
                 );
 
                 PRAGMA user_version = 1;
+            """
+        )
+
+    def _migrate_v2(self) -> None:
+        # 跨机构授权：授予方/接收方/字段范围/双方确认/撤销时间。
+        # 撤销是追加标记（revoked_*），记录永不删除，旧审计仍可查看。
+        self._conn.executescript(
+            """
+                CREATE TABLE IF NOT EXISTS grants (
+                    grant_id                  TEXT PRIMARY KEY,
+                    grantor_institution_id    TEXT NOT NULL,
+                    recipient_institution_id  TEXT NOT NULL,
+                    recipient_user_id         TEXT,
+                    field_scopes_json         TEXT NOT NULL,
+                    status                    TEXT NOT NULL,
+                    proposed_by               TEXT NOT NULL,
+                    proposed_at               TEXT NOT NULL,
+                    confirmed_by              TEXT,
+                    confirmed_at              TEXT,
+                    revoked_by                TEXT,
+                    revoked_at                TEXT,
+                    revoke_reason             TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_grants_parties
+                    ON grants(grantor_institution_id, recipient_institution_id, status);
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -667,6 +699,121 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    def list_audit_by_grant(self, grant_id: str) -> list[AuditEntry]:
+        """按授权 id 精确取审计轨迹（detail_json.grant_id）。
+
+        授权撤销不删除任何行，因此撤销后旧审计仍可完整查询。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM audit_log"
+            " WHERE json_extract(detail_json, '$.grant_id') = ?"
+            " ORDER BY at",
+            (grant_id,),
+        ).fetchall()
+        return [
+            AuditEntry(
+                audit_id=r["audit_id"],
+                package_id=r["package_id"],
+                institution_id=r["institution_id"],
+                actor_id=r["actor_id"],
+                action=r["action"],
+                at=r["at"],
+                detail=json.loads(r["detail_json"]),
+            )
+            for r in rows
+        ]
+
+    # ----------------------------------------------------------------- grants
+    def insert_grant(self, grant: CrossInstitutionGrant) -> None:
+        self._conn.execute(
+            "INSERT INTO grants(grant_id, grantor_institution_id,"
+            " recipient_institution_id, recipient_user_id, field_scopes_json,"
+            " status, proposed_by, proposed_at, confirmed_by, confirmed_at,"
+            " revoked_by, revoked_at, revoke_reason)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                grant.grant_id,
+                grant.grantor_institution_id,
+                grant.recipient_institution_id,
+                grant.recipient_user_id,
+                json.dumps(list(grant.field_scopes), ensure_ascii=False),
+                grant.status,
+                grant.proposed_by,
+                grant.proposed_at,
+                grant.confirmed_by,
+                grant.confirmed_at,
+                grant.revoked_by,
+                grant.revoked_at,
+                grant.revoke_reason,
+            ),
+        )
+
+    def get_grant(self, grant_id: str) -> CrossInstitutionGrant | None:
+        row = self._conn.execute(
+            "SELECT * FROM grants WHERE grant_id = ?", (grant_id,)
+        ).fetchone()
+        return None if row is None else _row_to_grant(row)
+
+    def update_grant(self, grant: CrossInstitutionGrant) -> None:
+        """整体更新（确认/撤销只追加标记，历史字段不被抹除）。"""
+        self._conn.execute(
+            "UPDATE grants SET status = ?, confirmed_by = ?, confirmed_at = ?,"
+            " revoked_by = ?, revoked_at = ?, revoke_reason = ?"
+            " WHERE grant_id = ?",
+            (
+                grant.status,
+                grant.confirmed_by,
+                grant.confirmed_at,
+                grant.revoked_by,
+                grant.revoked_at,
+                grant.revoke_reason,
+                grant.grant_id,
+            ),
+        )
+
+    def list_grants(
+        self,
+        grantor_institution_id: str | None = None,
+        recipient_institution_id: str | None = None,
+    ) -> list[CrossInstitutionGrant]:
+        sql = "SELECT * FROM grants"
+        conds: list[str] = []
+        params: list = []
+        if grantor_institution_id is not None:
+            conds.append("grantor_institution_id = ?")
+            params.append(grantor_institution_id)
+        if recipient_institution_id is not None:
+            conds.append("recipient_institution_id = ?")
+            params.append(recipient_institution_id)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY proposed_at"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_grant(r) for r in rows]
+
+    def find_active_grants(
+        self,
+        grantor_institution_id: str,
+        recipient_institution_id: str,
+        recipient_user_id: str,
+    ) -> list[CrossInstitutionGrant]:
+        """所有当前生效的授权（active 且未撤销），含机构级与用户级。
+
+        中间件每个新请求都实时执行本查询——撤销一旦落库，下一个请求
+        立即查不到该条生效授权；多条授权并存时字段范围取并集。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM grants"
+            " WHERE grantor_institution_id = ?"
+            "   AND recipient_institution_id = ?"
+            "   AND (recipient_user_id IS NULL OR recipient_user_id = ?)"
+            "   AND status = 'active'"
+            "   AND revoked_at IS NULL"
+            " ORDER BY confirmed_at",
+            (grantor_institution_id, recipient_institution_id, recipient_user_id),
+        ).fetchall()
+        return [_row_to_grant(r) for r in rows]
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +863,22 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_grant(row: sqlite3.Row) -> CrossInstitutionGrant:
+    return CrossInstitutionGrant(
+        grant_id=row["grant_id"],
+        grantor_institution_id=row["grantor_institution_id"],
+        recipient_institution_id=row["recipient_institution_id"],
+        recipient_user_id=row["recipient_user_id"],
+        field_scopes=tuple(json.loads(row["field_scopes_json"])),
+        status=row["status"],
+        proposed_by=row["proposed_by"],
+        proposed_at=row["proposed_at"],
+        confirmed_by=row["confirmed_by"],
+        confirmed_at=row["confirmed_at"],
+        revoked_by=row["revoked_by"],
+        revoked_at=row["revoked_at"],
+        revoke_reason=row["revoke_reason"],
     )
